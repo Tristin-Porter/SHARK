@@ -207,6 +207,108 @@ module Intake =
         | node -> [node]
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// §4b  SEMANTIC ANNOTATION  — structural enrichment based on parse tree shape
+// ═══════════════════════════════════════════════════════════════════════════════
+
+module Annotate =
+    let private opChars = set "+-*/<>=!&|^~%"
+
+    /// Classify a ParseNode structurally by its shape (walks the parse tree)
+    let rec classifyNode = function
+        | Terminal t ->
+            let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.')
+            let isStr = t.Length > 1 && (t.[0] = '"' || t.[0] = '\'')
+            let isOp  = t.Length > 0 && t.Length <= 2 && t |> Seq.forall (fun c -> Set.contains c opChars)
+            if isNum || isStr then "literal"
+            elif isOp then "operator"
+            else "identifier"
+        | NonTerm(_, children) ->
+            match children.Length with
+            | 0 -> "identifier"
+            | 1 -> classifyNode children.[0]
+            | 2 -> "operator"
+            | n when n >= 5 -> "block"
+            | _ -> "call"
+        | Coproduct _ -> "branch"
+        | Empty -> "empty"
+
+    /// Enrichment vector for each structural tag
+    let vecFor = function
+        | "literal"     -> { Cost=0.1; Prob=1.; Purity=1.; Safety=1.; Resource=0.1; Time=0.1; Energy=0.01 }
+        | "identifier"  -> { Cost=0.1; Prob=1.; Purity=1.; Safety=1.; Resource=0.1; Time=0.1; Energy=0.01 }
+        | "operator"    -> { Cost=0.3; Prob=1.; Purity=0.95; Safety=1.; Resource=0.1; Time=0.2; Energy=0.05 }
+        | "call"        -> { Cost=1.0; Prob=0.95; Purity=0.5; Safety=0.9; Resource=1.0; Time=1.0; Energy=0.5 }
+        | "block"       -> { Cost=0.5; Prob=0.95; Purity=0.8; Safety=0.9; Resource=0.5; Time=0.5; Energy=0.2 }
+        | "branch"      -> { Cost=0.5; Prob=0.5; Purity=0.9; Safety=0.9; Resource=0.3; Time=0.3; Energy=0.15 }
+        | "loop"        -> { Cost=5.0; Prob=0.9; Purity=0.5; Safety=0.8; Resource=5.0; Time=10.0; Energy=2.0 }
+        | "passthrough" -> { Cost=0.05; Prob=1.; Purity=1.; Safety=1.; Resource=0.05; Time=0.05; Energy=0.005 }
+        | _             -> V.zero
+
+    /// Detect cycles in the morphism graph → loop-like objects
+    let private findLoopHeads (d:Diagram) : ObjId Set =
+        let children oid =
+            d.Morphisms |> Map.toSeq
+            |> Seq.filter (fun (_,m) -> m.Src = oid)
+            |> Seq.map (fun (_,m) -> m.Tgt) |> Seq.toList
+        let mutable visited = Set.empty
+        let mutable inStack = Set.empty
+        let mutable loops   = Set.empty
+        let rec dfs oid =
+            if Set.contains oid inStack then loops <- Set.add oid loops
+            elif not (Set.contains oid visited) then
+                visited <- Set.add oid visited
+                inStack <- Set.add oid inStack
+                for c in children oid do dfs c
+                inStack <- Set.remove oid inStack
+        for (oid,_) in Map.toSeq d.Objects do dfs oid
+        loops
+
+    /// Enrich a diagram: classify objects by structural shape, assign vectors, effects, weights
+    let enrich (d:Diagram) : Diagram =
+        let loopHeads = findLoopHeads d
+        let outDeg =
+            d.Morphisms |> Map.fold (fun acc _ m ->
+                Map.add m.Src (1 + (match Map.tryFind m.Src acc with Some n -> n | None -> 0)) acc
+            ) Map.empty
+        let degOf oid = match Map.tryFind oid outDeg with Some n -> n | None -> 0
+        let objs' = d.Objects |> Map.map (fun oid obj ->
+            let tag =
+                if Set.contains oid loopHeads then "loop"
+                else
+                    match obj.Ty with
+                    | "terminal" ->
+                        let t = obj.Name
+                        let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.')
+                        let isStr = t.Length > 1 && (t.[0] = '"' || t.[0] = '\'')
+                        let isOp  = t.Length > 0 && t.Length <= 2 && t |> Seq.forall (fun c -> Set.contains c opChars)
+                        if isNum || isStr then "literal"
+                        elif isOp then "operator"
+                        else "identifier"
+                    | "choice" -> "branch"
+                    | "unit"   -> "empty"
+                    | _ ->
+                        match degOf oid with
+                        | 0 -> "identifier"
+                        | 1 -> "passthrough"
+                        | 2 -> "operator"
+                        | n when n >= 5 -> "block"
+                        | _ -> "call"
+            let vec = vecFor tag
+            let h = Merkle.ofString (sprintf "%s:%s:%A:%A" obj.Name obj.Ty [tag] vec)
+            { obj with Vec = vec; Effects = [tag]; Hash = h })
+        let mors' = d.Morphisms |> Map.map (fun _ mor ->
+            let sv = match Map.tryFind mor.Src objs' with Some o -> o.Vec | None -> V.zero
+            let tv = match Map.tryFind mor.Tgt objs' with Some o -> o.Vec | None -> V.zero
+            let w = V.compose sv tv
+            let h = Merkle.ofString (sprintf "%A->%A:%s:%A" mor.Src mor.Tgt mor.Label w)
+            { mor with Weight = w; Hash = h })
+        let d' = { d with Objects = objs'; Morphisms = mors' }
+        let oh = d'.Objects  |> Map.toSeq |> Seq.map (fun (_,o) -> o.Hash) |> Merkle.combineMany
+        let mh = d'.Morphisms|> Map.toSeq |> Seq.map (fun (_,m) -> m.Hash) |> Merkle.combineMany
+        let ch = d'.TwoCells |> Map.toSeq |> Seq.map (fun (_,c) -> c.Hash) |> Merkle.combineMany
+        { d' with RootHash = Merkle.combineMany [oh;mh;ch] }
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // §5  PROFUNCTORS & CO-ENDS  — operational semantics for the enriched IR
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -318,7 +420,7 @@ module Unifier =
 // §7  LOWERING ENGINE  — enriched functor selection, fusion, Kan extensions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-type Backend = LLVM | CSharp | JavaScript | WASM | GPU | HardwareDSL | ProbabilisticDSL
+type Backend = Backend of string
 
 type LowerFunctor =
     { Name       : string
@@ -611,10 +713,10 @@ module Pipeline =
         // 1. Parse
         let parseTree = Intake.parse cfg.Grammar tokens
 
-        // 2. Build source diagram from parse tree
+        // 2. Build source diagram from parse tree, then enrich with structural annotations
         let sourceDiagram =
             match parseTree with
-            | Some tree -> buildDiagram tree Diagram.empty |> fst
+            | Some tree -> buildDiagram tree Diagram.empty |> fst |> Annotate.enrich
             | None      -> Diagram.empty
 
         // 3. Unification: apply constraints, detect obstructions
