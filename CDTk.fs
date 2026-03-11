@@ -181,14 +181,14 @@ module Intake =
 
         and parseSeq (symbols:string list) (pos:int) : (ParseNode list * int) option =
             let mutable p = pos
-            let mutable nodes = []
+            let mutable acc = []
             let mutable ok = true
             for sym in symbols do
                 if ok then
                     match parseRule sym p with
-                    | Some(n, p') -> nodes <- nodes @ [n]; p <- p'
+                    | Some(n, p') -> acc <- n :: acc; p <- p'
                     | None        -> ok <- false
-            if ok then Some(nodes, p) else None
+            if ok then Some(List.rev acc, p) else None
 
         match Map.tryFind "start" g.Rules with
         | None   -> None
@@ -353,9 +353,10 @@ module Lowering =
         match functors with
         | []  -> failwith "empty functor list"
         | [f] -> f
-        | _   ->
+        | fs  ->
+            let back = fs |> List.rev |> List.head
             { Name     = functors |> List.map (fun f->f.Name) |> String.concat "∘"
-              Backend  = (List.last functors).Backend
+              Backend  = back.Backend
               MapObj   = fun o -> functors |> List.fold (fun o' f -> f.MapObj o') o
               MapMor   = fun m -> functors |> List.fold (fun m' f -> f.MapMor m') m
               MapCell  = fun c -> functors |> List.fold (fun c' f -> f.MapCell c') c
@@ -391,7 +392,7 @@ module Lowering =
         | Some f ->
             let missing =
                 d.Objects |> Map.toSeq
-                |> Seq.collect (fun (_,o) -> o.Effects |> List.filter (fun e -> not (Set.contains e f.Supported)) |> List.toSeq)
+                |> Seq.collect (fun (_,o) -> o.Effects |> List.filter (fun e -> not (Set.contains e f.Supported)))
                 |> Seq.distinct |> Seq.toList
             let kans = missing |> List.map (fun feat -> kanExtend feat LeftKan)
             let kanFunctor =
@@ -592,16 +593,16 @@ module Pipeline =
             Diagram.addObj t "terminal" [] V.zero d
         | NonTerm(name, children) ->
             let d1, parentId = Diagram.addObj name "nonterm" [] V.zero d
-            children |> List.fold (fun (dAcc, _) child ->
+            let addChild dAcc child =
                 let dAcc', childId = buildDiagram child dAcc
-                let dAcc'', _ = Diagram.addMor parentId childId "child" V.zero dAcc'
-                dAcc'', parentId) (d1, parentId)
+                Diagram.addMor parentId childId "child" V.zero dAcc' |> fst
+            (children |> List.fold addChild d1), parentId
         | Coproduct alts ->
             let d1, coprodId = Diagram.addObj "coproduct" "choice" [] V.zero d
-            alts |> List.fold (fun (dAcc, _) alt ->
+            let addAlt dAcc alt =
                 let dAcc', altId = buildDiagram alt dAcc
-                let dAcc'', _ = Diagram.addMor coprodId altId "alt" V.zero dAcc'
-                dAcc'', coprodId) (d1, coprodId)
+                Diagram.addMor coprodId altId "alt" V.zero dAcc' |> fst
+            (alts |> List.fold addAlt d1), coprodId
         | Empty ->
             Diagram.addObj "empty" "unit" [] V.zero d
 
