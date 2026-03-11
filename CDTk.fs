@@ -216,7 +216,7 @@ module Annotate =
     /// Classify a ParseNode structurally by its shape (walks the parse tree)
     let rec classifyNode = function
         | Terminal t ->
-            let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.')
+            let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.') && Seq.filter ((=) '.') t |> Seq.length <= 1
             let isStr = t.Length > 1 && (t.[0] = '"' || t.[0] = '\'')
             let isOp  = t.Length > 0 && t.Length <= 2 && t |> Seq.forall (fun c -> Set.contains c opChars)
             if isNum || isStr then "literal"
@@ -278,7 +278,7 @@ module Annotate =
                     match obj.Ty with
                     | "terminal" ->
                         let t = obj.Name
-                        let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.')
+                        let isNum = not(String.IsNullOrEmpty t) && t |> Seq.forall (fun c -> Char.IsDigit c || c = '.') && Seq.filter ((=) '.') t |> Seq.length <= 1
                         let isStr = t.Length > 1 && (t.[0] = '"' || t.[0] = '\'')
                         let isOp  = t.Length > 0 && t.Length <= 2 && t |> Seq.forall (fun c -> Set.contains c opChars)
                         if isNum || isStr then "literal"
